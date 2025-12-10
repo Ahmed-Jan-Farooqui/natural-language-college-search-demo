@@ -101,6 +101,8 @@ Your input will be of the form:
 3. For each Qi:
    - Extract the set of colleges found.
    - Maintain a mapping: Qi → {set of colleges}
+   - **Include colleges even if the confidence that they match the subquery is moderate (~70%)**
+   - If evidence is weak but the college seems related, still include it.
 4. Combine the sets using the boolean logic expression:
    - AND = set intersection
    - OR  = set union
@@ -108,18 +110,19 @@ Your input will be of the form:
 5. Rank final schools based on:
    - frequency of appearance
    - strength of evidence from search results
+   - **Include borderline matches lower in the ranking, but include as many as reasonably possible.**
 6. Return:
-   - final list of college names
+   - final list of college names (include all borderline matches)
    - list of references (all tool outputs)
 
 ### Important Rules:
 - You MUST use the web tool at least once per subquery.
 - You MUST follow the logic expression literally.
-- No guessing allowed; rely on the tool output.
-- Max 6 searches total.
+- Do NOT exclude colleges just because they are not a perfect match; include lower-confidence matches.
 
 Return the final output according to the SearchResult schema.
 '''
+
 
 
 search_agent = Agent(
@@ -168,7 +171,7 @@ async def pipeline(query: str, trace_box):
     # -------------------------
     # Run search agent
     # -------------------------
-    trace_box.write("Starting agent search...\n")
+    trace_box.write("Starting broader agent search...\n")
 
     with trace("Deterministic search flow") as t:
         # 1. Split query into structured subqueries
