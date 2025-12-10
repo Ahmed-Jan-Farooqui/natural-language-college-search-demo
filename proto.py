@@ -31,8 +31,16 @@ def chunk_list(data, chunk_size):
 # Models
 # -----------------------------
 
+class Snippet(BaseModel):
+    text: str
+
+class CollegeSnippets(BaseModel):
+    college: str
+    evidence: list[Snippet]
+
+
 class SearchResult(BaseModel):
-    college_names: list[str]
+    college_names: list[CollegeSnippets]
     references: list[str]
 
 
@@ -81,45 +89,86 @@ Return output in the QueryStructure schema.
 """
 
 search_agent_prompt = '''
-You are a multi-step research agent that receives a structured decomposition
-of a user query, consisting of:
-- A list of atomic sub-queries: Q1, Q2, Q3...
-- A boolean logic expression describing how to combine results: e.g. "(Q1 AND Q2) OR Q3"
+You are a high-recall research agent that receives:
+- A list of atomic search subqueries: Q1, Q2, Q3...
+- A boolean logic expression describing how these sets combine.
 
-Your input will be of the form:
-{
-  "subqueries": [...],
-  "logic": "(Q1 AND Q2) OR Q3"
-}
+Your job is to produce a VERY INCLUSIVE set of candidate colleges.
 
-### Your responsibilities:
+###############################
+# HIGH-RECALL BEHAVIOR
+###############################
+- Your priority is MAXIMUM RECALL. Include *any* college that is plausibly 
+  relevant based on search results.
+- If in doubt, include the candidate. Downstream agents will filter strictly.
+- Include justification for your choices against the college name in the college_names dictionary.
+- If sufficient justification cannot be found in the sources, DO NOT MAKE UP A JUSTIFICATION.
+- Do NOT exclude borderline results.
 
-1. **Write a short execution plan** before searching.
-2. For EACH subquery Qi:
-   - Transform Qi into 1–2 well-targeted web search queries.
-   - Call the web search tool for each search query.
-3. For each Qi:
-   - Extract the set of colleges found.
-   - Maintain a mapping: Qi → {set of colleges}
-4. Combine the sets using the boolean logic expression:
-   - AND = set intersection
-   - OR  = set union
-   - NOT = set complement (relative to all schools in any Qi)
-5. Rank final schools based on:
-   - frequency of appearance
-   - strength of evidence from search results
-6. Return:
-   - final list of college names
-   - list of references (all tool outputs)
+###############################
+# SEARCH STRATEGY (cost-aware)
+###############################
+For each Qi:
+- Generate **one primary** and **one alternate phrasing** ONLY.
+- Run at most **2 searches per Qi**.
+- Extract ANY college or university mentioned in the tool output.
 
-### Important Rules:
-- You MUST use the web tool at least once per subquery.
-- You MUST follow the logic expression literally.
-- No guessing allowed; rely on the tool output.
-- Max 6 searches total.
+###############################
+# DATA PROCESSING
+###############################
+For each Qi:
+- Build a set of all colleges found for Qi.
+Then apply the Boolean logic over these sets:
+- AND = intersection
+- OR = union
+- NOT = complement relative to all colleges seen in ANY Qi.
 
-Return the final output according to the SearchResult schema.
+###############################
+# OUTPUT
+###############################
+Return a large, inclusive list of candidate college names (unfiltered).
+Also return all web search URLs or snippets in `references`.
+
+Return using the SearchResult schema.
 '''
+
+filter_agent_prompt = """
+You are a strict evaluator agent.
+
+INPUT:
+1. The user's natural language query.
+2. A list of candidate college names from the search agent and evidence for its inclusion.
+3. The subqueries and logic that represent the decomposed query.
+
+TASK:
+Determine which colleges REALLY satisfy the user query.
+
+###############################
+# EVALUATION RULES
+###############################
+- You MUST follow the boolean logic expression strictly.
+- You MUST judge each college based on the subqueries, the original query, and the evidence provided.
+- If information is unclear or contradictory, DO NOT include the college.
+- Only include colleges with clear evidence of satisfying the constraints.
+
+###############################
+# OUTPUT
+###############################
+Return:
+{
+  "college_names": [filtered, high-precision list]
+}
+using the TranslationResult schema (list[str]).
+"""
+
+
+
+
+query_splitter_agent = Agent(
+    name="Query Splitter Agent",
+    instructions=query_splitter_agent_prompt,
+    output_type=QueryStructure
+)
 
 
 search_agent = Agent(
@@ -129,10 +178,11 @@ search_agent = Agent(
     output_type=SearchResult
 )
 
-query_splitter_agent = Agent(
-    name="Query Splitter Agent",
-    instructions=query_splitter_agent_prompt,
-    output_type=QueryStructure
+
+filter_agent = Agent(
+    name="Filtering Agent",
+    instructions=filter_agent_prompt,
+    output_type=TranslationResult
 )
 
 translation_agent = Agent(
@@ -189,13 +239,30 @@ async def pipeline(query: str, trace_box):
         college_names = search_result.final_output.college_names
         references = search_result.final_output.references
 
+        #3. Filter search agent output
+        trace_box.write("Filtering search output...\n")
+        filter_input = {
+            "query": query,
+            "subqueries": query_structure.final_output.subqueries,
+            "logic": query_structure.final_output.logic,
+            "candidates": [cs.model_dump() for cs in college_names]   # FIX
+        }
+
+
+        filtered_result = await Runner.run(
+            filter_agent,
+            json.dumps(filter_input, indent=2)
+        )
+
+        filtered_college_names = filtered_result.final_output.college_names
+
         # -------------------------
         # Embeddings for found college names
         # -------------------------
         trace_box.write("Embedding returned college names...\n")
         college_names_dict = {}
 
-        for i, name_chunk in enumerate(chunk_list(college_names, BATCH_SIZE)):
+        for i, name_chunk in enumerate(chunk_list(filtered_college_names, BATCH_SIZE)):
             try:
                 response = client.embeddings.create(
                     input=name_chunk, model=MODEL_NAME
