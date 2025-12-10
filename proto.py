@@ -39,40 +39,100 @@ class SearchResult(BaseModel):
 class TranslationResult(BaseModel):
     college_names: list[str]
 
+class QueryStructure(BaseModel):
+    subqueries: list[str]   # ["party schools", "California", "skiing nearby"]
+    logic: str              # "(Q1 AND Q2) OR Q3"
+
+
 
 # -----------------------------
 # Agents
 # -----------------------------
 
-search_agent_prompt = '''
-You are a multi-step research agent specialized in finding U.S. colleges 
-based on complex, multi-criteria queries. 
-Before searching, always output a short plan in natural language, then execute it.
+query_splitter_agent_prompt = """
+You are an expert query-decomposition agent.
 
-### What you must do:
-1. Break the user's query into separate intents (e.g. “party schools”, “California”, “skiing nearby”).
-2. For EACH intent, write one or more web search queries.
-3. Use the web search tool MULTIPLE times—one per intent.
-4. Extract candidate colleges from each set of results.
-5. Combine the results:
-   - If the user implies AND conditions → use set INTERSECTION.
-   - If the user implies OR conditions → use set UNION.
-6. Rank the final schools by strength of evidence (based on tool output).
-7. Return the final list of college names AND all references.
+### Your task:
+Given a user natural-language query (e.g. "great CS schools in California or New York with good snowboarding"),
+produce:
+
+1. A list of **atomic sub-queries**, each self-contained and suitable for web search.
+2. A **Boolean logic expression** describing how they relate.
 
 ### Rules:
-- You MUST use the tool more than once for multi-facet queries.
-- Do not guess—rely only on search results.
-- Be exhaustive but efficient; do not exceed 6 searches.
+- Sub-queries should be the minimum units that can be searched independently.
+- Use parentheses in the logic expression.
+- Use only `AND`, `OR`, `NOT`.
+- The logic must reference sub-queries as Q1, Q2, Q3... in order.
+
+### Example:
+User: "good engineering colleges near mountains AND skiing OR big party schools"
+Output:
+{
+  "subqueries": [
+    "engineering colleges near mountains",
+    "colleges near skiing locations",
+    "big party schools"
+  ],
+  "logic": "(Q1 AND Q2) OR Q3"
+}
+
+Return output in the QueryStructure schema.
+"""
+
+search_agent_prompt = '''
+You are a multi-step research agent that receives a structured decomposition
+of a user query, consisting of:
+- A list of atomic sub-queries: Q1, Q2, Q3...
+- A boolean logic expression describing how to combine results: e.g. "(Q1 AND Q2) OR Q3"
+
+Your input will be of the form:
+{
+  "subqueries": [...],
+  "logic": "(Q1 AND Q2) OR Q3"
+}
+
+### Your responsibilities:
+
+1. **Write a short execution plan** before searching.
+2. For EACH subquery Qi:
+   - Transform Qi into 1–2 well-targeted web search queries.
+   - Call the web search tool for each search query.
+3. For each Qi:
+   - Extract the set of colleges found.
+   - Maintain a mapping: Qi → {set of colleges}
+4. Combine the sets using the boolean logic expression:
+   - AND = set intersection
+   - OR  = set union
+   - NOT = set complement (relative to all schools in any Qi)
+5. Rank final schools based on:
+   - frequency of appearance
+   - strength of evidence from search results
+6. Return:
+   - final list of college names
+   - list of references (all tool outputs)
+
+### Important Rules:
+- You MUST use the web tool at least once per subquery.
+- You MUST follow the logic expression literally.
+- No guessing allowed; rely on the tool output.
+- Max 6 searches total.
 
 Return the final output according to the SearchResult schema.
 '''
+
 
 search_agent = Agent(
     name="Search Agent",
     instructions=search_agent_prompt,
     tools=[WebSearchTool()],
     output_type=SearchResult
+)
+
+query_splitter_agent = Agent(
+    name="Query Splitter Agent",
+    instructions=query_splitter_agent_prompt,
+    output_type=QueryStructure
 )
 
 translation_agent = Agent(
@@ -111,9 +171,18 @@ async def pipeline(query: str, trace_box):
     trace_box.write("Starting agent search...\n")
 
     with trace("Deterministic search flow") as t:
+        # 1. Split query into structured subqueries
+        trace_box.write("Decomposing query...\n")
+        query_structure = await Runner.run(
+            query_splitter_agent,
+            query
+        )
+
+        # 2. Run the search agent using the structured form
+        trace_box.write("Running search agent...\n")
         search_result = await Runner.run(
             search_agent,
-            query,
+            json.dumps(query_structure.final_output.model_dump(), indent=2)  # pass structured data
         )
         trace_box.write("Search agent completed.\n")
 
@@ -208,10 +277,13 @@ if run_button and query.strip():
         for name in final_college_names:
             if name in colleges_dict:
                 desc = colleges_dict[name].get("description", "No description available.")
+                state = colleges_dict[name].get("state", "N/A")
+                city = colleges_dict[name].get("city", "N/A")
             else:
                 desc = "(Description not found)"
 
             st.markdown(f"### **{name}**")
+            st.markdown(f"### ***{state}, {city}***")
             st.write(desc)
             st.markdown("---")
 
