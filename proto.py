@@ -252,12 +252,14 @@ if run_button and query.strip():
                 desc = colleges_dict[name].get("description", "No description available.")
                 state = colleges_dict[name].get("state", "N/A")
                 city = colleges_dict[name].get("city", "N/A")
+                college_id = colleges_dict[name].get("college_id")
+                url = f"https://app.kollegio.ai/college/{college_id}"
             else:
                 st.markdown(f'### **{name}**')
                 st.markdown(f'### * Found in search, but mistranslated / does not exist in our database.')
                 continue
 
-            st.markdown(f"### **{name}**")
+            st.markdown(f"### **[{name}]({url})**")
             st.markdown(f"### ***{state}, {city}***")
             st.write(desc)
             st.markdown("---")
