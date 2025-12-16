@@ -34,14 +34,11 @@ def chunk_list(data, chunk_size):
 class SearchResult(BaseModel):
     college_names: list[str]
     references: list[str]
+    queries_ran: list[str]
 
 
 class TranslationResult(BaseModel):
     college_names: list[str]
-
-class QueryStructure(BaseModel):
-    subqueries: list[str]   # ["party schools", "California", "skiing nearby"]
-    logic: str              # "(Q1 AND Q2) OR Q3"
 
 
 
@@ -49,79 +46,59 @@ class QueryStructure(BaseModel):
 # Agents
 # -----------------------------
 
-query_splitter_agent_prompt = """
-You are an expert query-decomposition agent.
+search_agent_prompt = """
+    You are a recall-first college research agent.
 
-### Your task:
-Given a user natural-language query (e.g. "great CS schools in California or New York with good snowboarding"),
-produce:
+    Your goal is to return AS MANY potentially relevant U.S. colleges as possible.
 
-1. A list of **atomic sub-queries**, each self-contained and suitable for web search.
-2. A **Boolean logic expression** describing how they relate.
+    You will be given a single natural-language query from a user.
+    You must decide how to search — there is NO predefined structure.
 
-### Rules:
-- Sub-queries should be the minimum units that can be searched independently.
-- Use parentheses in the logic expression.
-- Use only `AND`, `OR`, `NOT`.
-- The logic must reference sub-queries as Q1, Q2, Q3... in order.
+    ### Core principles
+    - Recall > precision
+    - Include borderline, indirect, and partial matches
+    - Never over-filter
+    - Redundancy is good
+    - Prioritize sources that provide a list of colleges relevant to the query.
 
-### Example:
-User: "good engineering colleges near mountains AND skiing OR big party schools"
-Output:
-{
-  "subqueries": [
-    "engineering colleges near mountains",
-    "colleges near skiing locations",
-    "big party schools"
-  ],
-  "logic": "(Q1 AND Q2) OR Q3"
-}
+    ### Execution steps
 
-Return output in the QueryStructure schema.
+    1. Rewrite the user query into MULTIPLE diverse web searches, including:
+    - Broad interpretations
+    - Narrow interpretations
+    - Synonyms and rephrasings
+    - Location-based variants
+    - Program-based variants
+    - Lifestyle or attribute-based variants
+
+    2. You MUST perform AT LEAST 3 distinct web searches.
+    - More if the query is complex
+    - Each search should target a different angle
+
+    3. For EACH search:
+    - Extract ALL colleges mentioned
+    - Include schools even if relevance is uncertain
+    - Prefer inclusion over exclusion
+
+    4. Maintain an internal mapping of:
+    college_name → number of mentions / search angles
+
+    5. Rank colleges by:
+    - Frequency of appearance
+    - Strength of association (if evident)
+    - But NEVER drop low-ranked colleges unless clearly irrelevant
+
+    6. Do NOT try to enforce logical constraints.
+    The pipeline downstream will handle normalization and filtering.
+
+    ### Output
+    Return:
+    - A ranked list of college names (highest recall first)
+    - A list of all references used
+    - A list of all queries that you ran.
+
+    Return output using the SearchResult schema.
 """
-
-search_agent_prompt = '''
-You are a multi-step research agent that receives a structured decomposition
-of a user query, consisting of:
-- A list of atomic sub-queries: Q1, Q2, Q3...
-- A boolean logic expression describing how to combine results: e.g. "(Q1 AND Q2) OR Q3"
-
-Your input will be of the form:
-{
-  "subqueries": [...],
-  "logic": "(Q1 AND Q2) OR Q3"
-}
-
-### Your responsibilities:
-
-1. **Write a short execution plan** before searching.
-2. For EACH subquery Qi:
-   - Transform Qi into 1–2 well-targeted web search queries.
-   - Call the web search tool for each search query.
-3. For each Qi:
-   - Extract the set of colleges found.
-   - Maintain a mapping: Qi → {set of colleges}
-   - **Include colleges even if the confidence that they match the subquery is moderate (~70%)**
-   - If evidence is weak but the college seems related, still include it.
-4. Combine the sets using the boolean logic expression:
-   - AND = set intersection
-   - OR  = set union
-   - NOT = set complement (relative to all schools in any Qi)
-5. Rank final schools based on:
-   - frequency of appearance
-   - strength of evidence from search results
-   - **Include borderline matches lower in the ranking, but include as many as reasonably possible.**
-6. Return:
-   - final list of college names (include all borderline matches)
-   - list of references (all tool outputs)
-
-### Important Rules:
-- You MUST use the web tool at least once per subquery.
-- You MUST follow the logic expression literally.
-- Do NOT exclude colleges just because they are not a perfect match; include lower-confidence matches.
-
-Return the final output according to the SearchResult schema.
-'''
 
 
 
@@ -130,12 +107,6 @@ search_agent = Agent(
     instructions=search_agent_prompt,
     tools=[WebSearchTool()],
     output_type=SearchResult
-)
-
-query_splitter_agent = Agent(
-    name="Query Splitter Agent",
-    instructions=query_splitter_agent_prompt,
-    output_type=QueryStructure
 )
 
 translation_agent = Agent(
@@ -174,23 +145,18 @@ async def pipeline(query: str, trace_box):
     trace_box.write("Starting broader agent search...\n")
 
     with trace("Deterministic search flow") as t:
-        # 1. Split query into structured subqueries
-        trace_box.write("Decomposing query...\n")
-        query_structure = await Runner.run(
-            query_splitter_agent,
-            query
-        )
-
-        # 2. Run the search agent using the structured form
-        trace_box.write("Running search agent...\n")
+        # 2. Run scoring-based search agent
         search_result = await Runner.run(
             search_agent,
-            json.dumps(query_structure.final_output.model_dump(), indent=2)  # pass structured data
+            query,
         )
-        trace_box.write("Search agent completed.\n")
 
         college_names = search_result.final_output.college_names
         references = search_result.final_output.references
+        searches = search_result.final_output.queries_ran
+
+        trace_box.write(f'Search returned {len(college_names)} results...\n')
+        trace_box.write(f'College names:\n{college_names}')
 
         # -------------------------
         # Embeddings for found college names
@@ -232,16 +198,19 @@ async def pipeline(query: str, trace_box):
         # Translation Agent
         # -------------------------
         trace_box.write("Running translation agent...\n")
-        final_colleges = await Runner.run(
+        trans_result = await Runner.run(
             translation_agent,
             json.dumps(final_names, indent=2)
         )
+        final_colleges = list(set(trans_result.final_output.college_names))
+        
 
     return (
-        final_colleges.final_output.college_names,
+        final_colleges,
         references,
         colleges,
-        json.dumps(t.export(), indent=2)  # FULL agent trace
+        json.dumps(t.export(), indent=2),  # FULL agent trace
+        searches,
     )
 
 
@@ -267,7 +236,8 @@ if run_button and query.strip():
         final_college_names,
         references,
         colleges_dict,
-        trace_output
+        trace_output,
+        searches,
     ) = results
 
     trace_box.write(trace_output)
@@ -283,7 +253,9 @@ if run_button and query.strip():
                 state = colleges_dict[name].get("state", "N/A")
                 city = colleges_dict[name].get("city", "N/A")
             else:
-                desc = "(Description not found)"
+                st.markdown(f'### **{name}**')
+                st.markdown(f'### * Found in search, but mistranslated / does not exist in our database.')
+                continue
 
             st.markdown(f"### **{name}**")
             st.markdown(f"### ***{state}, {city}***")
@@ -293,4 +265,8 @@ if run_button and query.strip():
     st.subheader("🔗 References")
     for ref in references:
         st.markdown(f"- [{ref}]({ref})")
+
+    st.subheader("🔗 Searches")
+    for search in searches:
+        st.markdown(f"- {search} ")
 
