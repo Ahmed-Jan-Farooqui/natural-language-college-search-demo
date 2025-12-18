@@ -113,9 +113,19 @@ translation_agent = Agent(
     name="Translation Agent",
     instructions='''
     You are a helpful agent that will be given input of the following form:
-        { <college_name> : [list of candidate names], ... }
-    Your job is to figure out which candidate name corresponds to the actual name,
-    and return that.
+    
+    data: {
+        <college_name>: <college_id>
+        .
+        .
+        .    
+    }
+    colleges: [<college_name_1>, ..., <college_name_n>]
+
+
+    Your job is to map each college's name in the colleges list to a college in the available data dictionary.
+    and return the final, mapped names.
+    If there are no matches found for a given college in the data, skip it. 
     ''',
     output_type=TranslationResult
 )
@@ -138,6 +148,7 @@ async def pipeline(query: str, trace_box):
     with open("data/current-colleges.json", "r") as f:
         temp = json.load(f)
         colleges = {c["name"]: c for c in temp}
+        college_ids = {c["name"]: c["college_id"] for c in temp}
 
     # -------------------------
     # Run search agent
@@ -158,49 +169,50 @@ async def pipeline(query: str, trace_box):
         trace_box.write(f'Search returned {len(college_names)} results...\n')
         trace_box.write(f'College names:\n{college_names}')
 
-        # -------------------------
-        # Embeddings for found college names
-        # -------------------------
-        trace_box.write("Embedding returned college names...\n")
-        college_names_dict = {}
+        # # -------------------------
+        # # Embeddings for found college names
+        # # -------------------------
+        # trace_box.write("Embedding returned college names...\n")
+        # college_names_dict = {}
 
-        for i, name_chunk in enumerate(chunk_list(college_names, BATCH_SIZE)):
-            try:
-                response = client.embeddings.create(
-                    input=name_chunk, model=MODEL_NAME
-                )
-                for j, emb in enumerate(response.data):
-                    college_names_dict[name_chunk[j]] = emb.embedding
-            except Exception as e:
-                trace_box.write(f"Embedding batch error: {e}\n")
-                time.sleep(4)
-                continue
+        # for i, name_chunk in enumerate(chunk_list(college_names, BATCH_SIZE)):
+        #     try:
+        #         response = client.embeddings.create(
+        #             input=name_chunk, model=MODEL_NAME
+        #         )
+        #         for j, emb in enumerate(response.data):
+        #             college_names_dict[name_chunk[j]] = emb.embedding
+        #     except Exception as e:
+        #         trace_box.write(f"Embedding batch error: {e}\n")
+        #         time.sleep(4)
+        #         continue
 
-        # -------------------------
-        # Find top matches using cosine similarity
-        # -------------------------
-        trace_box.write("Computing similarities...\n")
-        final_names = {}
+        # # -------------------------
+        # # Find top matches using cosine similarity
+        # # -------------------------
+        # trace_box.write("Computing similarities...\n")
+        # final_names = {}
 
-        for query_name, emb in college_names_dict.items():
-            first, second, third = (0, ""), (0, ""), (0, "")
-            for stored_name, stored_embedding in embeddings_dict.items():
-                score = cosine_similarity(emb, stored_embedding)
-                if score > first[0]:
-                    first = (score, stored_name)
-                elif score > second[0]:
-                    second = (score, stored_name)
-                elif score > third[0]:
-                    third = (score, stored_name)
-            final_names[query_name] = [first[1], second[1], third[1]]
+        # for query_name, emb in college_names_dict.items():
+        #     first, second, third = (0, ""), (0, ""), (0, "")
+        #     for stored_name, stored_embedding in embeddings_dict.items():
+        #         score = cosine_similarity(emb, stored_embedding)
+        #         if score > first[0]:
+        #             first = (score, stored_name)
+        #         elif score > second[0]:
+        #             second = (score, stored_name)
+        #         elif score > third[0]:
+        #             third = (score, stored_name)
+        #     final_names[query_name] = [first[1], second[1], third[1]]
 
         # -------------------------
         # Translation Agent
         # -------------------------
         trace_box.write("Running translation agent...\n")
+        trans_query = f'Available colleges: {json.dumps(college_ids, indent=2)} \n Colleges to match: {college_names}'
         trans_result = await Runner.run(
             translation_agent,
-            json.dumps(final_names, indent=2)
+            trans_query,
         )
         final_colleges = list(set(trans_result.final_output.college_names))
         
